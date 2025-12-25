@@ -1,0 +1,931 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Solfège Trainer</title>
+  <style>
+    body{font-family:system-ui;margin:16px}
+    button, select, label{padding:10px 12px;margin:6px;border-radius:10px}
+    .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+    canvas{border:1px solid #ddd;border-radius:12px;width:100%;max-width:520px;height:auto}
+    .ok{color:green} .bad{color:crimson}
+    .small{font-size:0.95em;opacity:0.85}
+    .pill{padding:4px 10px;border:1px solid #ddd;border-radius:999px}
+  </style>
+</head>
+<body>
+  <h2>Solfège Trainer</h2>
+
+  <div class="row">
+    <button id="tabRead">Note Reading</button>
+    <button id="tabEar">Ear Training</button>
+
+    <span class="small">Instrument:</span>
+    <select id="soundSel">
+      <option value="violin" selected>Violin (sampled)</option>
+      <option value="piano">Piano (sampled)</option>
+    </select>
+
+    <span class="small">Step:</span>
+    <select id="stepSel">
+      <option value="0.35">0.35s</option>
+      <option value="0.45">0.45s</option>
+      <option value="0.55" selected>0.55s</option>
+      <option value="0.70">0.70s</option>
+    </select>
+
+    <label class="small" style="display:flex;align-items:center;gap:8px;border:1px solid #ddd;">
+      <input id="ledgerToggle" type="checkbox" checked />
+      Include ledger notes
+    </label>
+
+    <span class="small">A4:</span>
+    <select id="a4Sel">
+      <option value="440" selected>440 Hz</option>
+      <option value="442">442 Hz</option>
+    </select>
+
+    <span id="modeBadge" class="pill">Reading</span>
+  </div>
+
+  <p id="status"></p>
+  <canvas id="staff" width="520" height="240"></canvas>
+  <div id="controls"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js"></script>
+
+<script>
+/* -------------------- CONFIG -------------------- */
+const TWO_NOTE_LEGATO_PROB = 0.30;
+
+const READ_SINGLE_NOTE_LEN = 0.35;
+
+const EAR_TAP_NOTE_LEN = 0.32;
+const EAR_REVEAL_NOTE_LEN = 0.45;
+
+function noteLenForArt(stepLen, articulation){
+  if(articulation === "legato") return Math.max(0.18, stepLen * 1.08);
+  return Math.max(0.14, stepLen * 0.72);
+}
+
+/* -------------------- CORE DATA -------------------- */
+const solfege = ["Do","Re","Mi","Fa","Sol","La","Si"];
+
+const basePool = [
+  {name:"Mi",  midi:64, step:0},
+  {name:"Fa",  midi:65, step:1},
+  {name:"Sol", midi:67, step:2},
+  {name:"La",  midi:69, step:3},
+  {name:"Si",  midi:71, step:4},
+  {name:"Do",  midi:72, step:5},
+  {name:"Re",  midi:74, step:6},
+  {name:"Mi",  midi:76, step:7},
+  {name:"Fa",  midi:77, step:8},
+];
+
+const ledgerPool = [
+  {name:"Re",  midi:62, step:-1},
+  {name:"Do",  midi:60, step:-2},
+  {name:"Si",  midi:59, step:-3},
+  {name:"La",  midi:57, step:-4},
+  {name:"Sol", midi:79, step:9},
+  {name:"La",  midi:81, step:10},
+  {name:"Si",  midi:83, step:11},
+  {name:"Do",  midi:84, step:12},
+];
+
+function getActivePool(){
+  return document.getElementById("ledgerToggle").checked
+    ? basePool.concat(ledgerPool)
+    : basePool;
+}
+
+/* -------------------- UI -------------------- */
+let ctx, audioCtx;
+const staffEl = document.getElementById("staff");
+ctx = staffEl.getContext("2d");
+const statusEl = document.getElementById("status");
+const controlsEl = document.getElementById("controls");
+
+const soundSel = document.getElementById("soundSel");
+const stepSel = document.getElementById("stepSel");
+const a4Sel = document.getElementById("a4Sel");
+const ledgerToggle = document.getElementById("ledgerToggle");
+const modeBadge = document.getElementById("modeBadge");
+
+let mode = "read"; // "read" | "ear"
+
+/* -------------------- DRAWING -------------------- */
+const STAFF_TOP_Y = 70;
+const STAFF_SPACING = 14;
+const STAFF_LEFT_X = 30;
+const STAFF_RIGHT_X = 490;
+
+const STAFF_MIN_LINE_STEP = 0;
+const STAFF_MAX_LINE_STEP = 8;
+
+function setStatus(msg, cls){
+  statusEl.className = cls || "";
+  statusEl.textContent = msg;
+}
+
+function stepToY(step){
+  const bottomLineY = STAFF_TOP_Y + 4*STAFF_SPACING;
+  return bottomLineY - step*(STAFF_SPACING/2);
+}
+
+function drawStaff() {
+  ctx.clearRect(0,0,staffEl.width,staffEl.height);
+  ctx.lineWidth = 2;
+  for(let i=0;i<5;i++){
+    const y = STAFF_TOP_Y + i*STAFF_SPACING;
+    ctx.beginPath();
+    ctx.moveTo(STAFF_LEFT_X, y);
+    ctx.lineTo(STAFF_RIGHT_X, y);
+    ctx.stroke();
+  }
+}
+
+function drawLedgerLinesForNote(step, x){
+  const isAbove = step > STAFF_MAX_LINE_STEP;
+  const isBelow = step < STAFF_MIN_LINE_STEP;
+  if(!isAbove && !isBelow) return;
+
+  let last;
+  if(isAbove){
+    last = (step % 2 === 0) ? step : step - 1;
+    for(let s = STAFF_MAX_LINE_STEP + 2; s <= last; s += 2){
+      const y = stepToY(s);
+      ctx.beginPath();
+      ctx.moveTo(x - 18, y);
+      ctx.lineTo(x + 18, y);
+      ctx.stroke();
+    }
+  } else {
+    last = (step % 2 === 0) ? step : step + 1;
+    for(let s = STAFF_MIN_LINE_STEP - 2; s >= last; s -= 2){
+      const y = stepToY(s);
+      ctx.beginPath();
+      ctx.moveTo(x - 18, y);
+      ctx.lineTo(x + 18, y);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawNoteAt(step, x){
+  const y = stepToY(step);
+  drawLedgerLinesForNote(step, x);
+
+  ctx.fillStyle = "#000";
+  ctx.beginPath();
+  ctx.ellipse(x,y,10,7, -0.3, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(x+10,y);
+  ctx.lineTo(x+10,y-45);
+  ctx.stroke();
+}
+
+function drawSlurAbove(x1, step1, x2, step2){
+  const y1 = stepToY(step1);
+  const y2 = stepToY(step2);
+  const highestY = Math.min(y1, y2);
+  const endY = highestY - 55;
+  const ctrlY = highestY - 85;
+  const midX = (x1 + x2) / 2;
+
+  ctx.beginPath();
+  ctx.moveTo(x1, endY);
+  ctx.quadraticCurveTo(midX, ctrlY, x2, endY);
+  ctx.stroke();
+}
+
+/* -------------------- AUDIO -------------------- */
+const SOUNDFONT_SET = "FluidR3_GM";
+const FORMAT = "mp3";
+const INSTRUMENT_MAP = { violin: "violin", piano: "acoustic_grand_piano" };
+
+const instrumentCache = new Map();
+let activeVoices = [];
+
+function ensureAudio(){
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+async function enableAudio(){
+  ensureAudio();
+  await audioCtx.resume();
+}
+function midiToFreq(midi){
+  const A4 = Number(a4Sel.value);
+  return A4 * Math.pow(2, (midi-69)/12);
+}
+
+function synthNote(midi, when, duration, type){
+  const freq = midiToFreq(midi);
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+
+  if(type === "piano"){
+    o.type = "sine";
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(0.35, when+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, when+Math.max(0.08, duration));
+    o.frequency.setValueAtTime(freq, when);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(when);
+    o.stop(when + duration + 0.05);
+    activeVoices.push({ stop:(t)=>{ try{o.stop(t);}catch(e){} } });
+    return;
+  }
+
+  o.type = "sawtooth";
+  o.frequency.setValueAtTime(freq, when);
+
+  const lfo = audioCtx.createOscillator();
+  lfo.type = "sine";
+  lfo.frequency.setValueAtTime(5.5, when);
+  const lfoGain = audioCtx.createGain();
+  lfoGain.gain.setValueAtTime(freq * 0.004, when);
+  lfo.connect(lfoGain).connect(o.frequency);
+
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(0.25, when+0.05);
+  g.gain.setValueAtTime(0.20, when+Math.min(0.25, duration*0.6));
+  g.gain.exponentialRampToValueAtTime(0.0001, when+duration);
+
+  const f = audioCtx.createBiquadFilter();
+  f.type = "lowpass";
+  f.frequency.setValueAtTime(2800, when);
+  f.Q.setValueAtTime(0.7, when);
+
+  o.connect(f).connect(g).connect(audioCtx.destination);
+
+  lfo.start(when);
+  o.start(when);
+  o.stop(when + duration + 0.05);
+  lfo.stop(when + duration + 0.05);
+
+  activeVoices.push({ stop:(t)=>{ try{o.stop(t);}catch(e){} } });
+}
+
+async function loadInstrument(instrumentName){
+  await enableAudio();
+  if(!window.Soundfont) throw new Error("soundfont-player not loaded.");
+  const key = `${SOUNDFONT_SET}:${FORMAT}:${instrumentName}`;
+  if(instrumentCache.has(key)) return instrumentCache.get(key);
+
+  const p = window.Soundfont.instrument(audioCtx, instrumentName, {
+    soundfont: SOUNDFONT_SET,
+    format: FORMAT
+  });
+  instrumentCache.set(key, p);
+  return p;
+}
+
+function stopAllSounds(){
+  if(!audioCtx) return;
+  const t = audioCtx.currentTime;
+  for(const v of activeVoices){
+    try { v.stop(t); } catch(e) {}
+  }
+  activeVoices = [];
+}
+
+async function playEvents(events, opts = {}){
+  await enableAudio();
+  stopAllSounds();
+
+  const stepLen = Number(stepSel.value);
+  const articulation = opts.articulation || "normal";
+  const noteLen = ("noteLen" in opts) ? opts.noteLen : noteLenForArt(stepLen, articulation);
+  const gain = ("gain" in opts) ? opts.gain : 0.85;
+  const instrumentName = INSTRUMENT_MAP[soundSel.value];
+
+  const baseTime = audioCtx.currentTime + 0.06;
+
+  let inst = null;
+  let sampledOk = true;
+  try { inst = await loadInstrument(instrumentName); }
+  catch(e){ sampledOk = false; }
+
+  for(const ev of events){
+    const start = baseTime + ev.t;
+    for(const midi of ev.notes){
+      if(sampledOk && inst){
+        try{
+          const voice = inst.play(midi, start, { gain, duration: noteLen });
+          if(voice && typeof voice.stop === "function"){
+            activeVoices.push(voice);
+            try { voice.stop(start + noteLen); } catch(e) {}
+          }
+        } catch(e){
+          sampledOk = false;
+        }
+      }
+      if(!sampledOk){
+        const type = (soundSel.value === "piano") ? "piano" : "violin";
+        synthNote(midi, start, noteLen, type);
+      }
+    }
+  }
+
+  if(!sampledOk){
+    setStatus("⚠️ Sample audio unavailable (offline/CDN blocked). Using synth fallback.", "bad");
+  }
+}
+
+/* -------------------- GENERATION HELPERS -------------------- */
+function randInt(n){ return Math.floor(Math.random()*n); }
+function weightedChoice(items, weights){
+  let total = 0;
+  for(const w of weights) total += w;
+  let r = Math.random() * total;
+  for(let i=0;i<items.length;i++){
+    r -= weights[i];
+    if(r <= 0) return items[i];
+  }
+  return items[items.length-1];
+}
+function weightForDelta(delta){
+  const a = Math.abs(delta);
+  if(a === 0) return 2.2;
+  if(a === 1) return 6.0;
+  if(a === 2) return 3.2;
+  if(a === 3) return 1.8;
+  if(a === 4) return 1.0;
+  return 0.5;
+}
+function pickNextIndex(currIndex, pool){
+  const candidates = [];
+  const weights = [];
+  for(let j=0;j<pool.length;j++){
+    candidates.push(j);
+    weights.push(weightForDelta(j - currIndex));
+  }
+  return weightedChoice(candidates, weights);
+}
+
+/* ============================================================
+   NOTE READING TAB (MERGED)
+   ============================================================ */
+let readCount = 1;               // 1 or 2
+let readPlayMode = "separate";   // separate | together (only when readCount=2)
+let readArticulation = "normal"; // generated for 2 separate
+let readQ = null;               // {notes:[noteObj,...]}
+let readSolved = false;
+let readSolvedFirst = false;
+let readSolvedSecond = false;
+
+function readBuildEvents(){
+  const stepLen = Number(stepSel.value);
+  const midis = readQ.notes.map(n => n.midi);
+
+  if(readCount === 1){
+    return [{ t:0, notes:[midis[0]] }];
+  }
+  if(readPlayMode === "together"){
+    return [{ t:0, notes:[midis[0], midis[1]] }];
+  }
+  return [{ t:0, notes:[midis[0]] }, { t:stepLen, notes:[midis[1]] }];
+}
+
+function readRenderVisual(){
+  drawStaff();
+  if(!readQ) return;
+
+  if(readCount === 1){
+    drawNoteAt(readQ.notes[0].step, 260);
+    return;
+  }
+
+  if(readPlayMode === "together"){
+    drawNoteAt(readQ.notes[0].step, 270);
+    drawNoteAt(readQ.notes[1].step, 270);
+    return;
+  }
+
+  const x1 = 210, x2 = 330;
+  drawNoteAt(readQ.notes[0].step, x1);
+  drawNoteAt(readQ.notes[1].step, x2);
+  if(readArticulation === "legato"){
+    drawSlurAbove(x1, readQ.notes[0].step, x2, readQ.notes[1].step);
+  }
+}
+
+function newReadQuestion(){
+  stopAllSounds();
+  readSolved = false;
+  readSolvedFirst = false;
+  readSolvedSecond = false;
+
+  const pool = getActivePool();
+
+  if(readCount === 1){
+    const n = pool[randInt(pool.length)];
+    readQ = { notes:[n] };
+    readArticulation = "normal";
+  } else {
+    const i1 = randInt(pool.length);
+    const i2 = pickNextIndex(i1, pool);
+    const n1 = pool[i1];
+    const n2 = pool[i2];
+
+    const isChord = (readPlayMode === "together");
+    readArticulation = (!isChord && Math.random() < TWO_NOTE_LEGATO_PROB) ? "legato" : "normal";
+
+    readQ = { notes:[n1, n2] };
+    if(isChord) readArticulation = "normal";
+  }
+
+  readRenderVisual();
+
+  if(readCount === 1){
+    setStatus("Note reading: name the note.");
+  } else if(readPlayMode === "together"){
+    setStatus("Note reading: chord shown. Answer 1st note name, then 2nd.");
+  } else {
+    setStatus(`Note reading: 2 notes shown. (Articulation: ${readArticulation.toUpperCase()}) Answer 1st, then 2nd.`);
+  }
+
+  renderReadControls();
+}
+
+function renderReadControls(){
+  controlsEl.innerHTML = "";
+
+  const top = document.createElement("div");
+  top.className = "row";
+
+  const enableBtn = document.createElement("button");
+  enableBtn.textContent = "Enable audio";
+  enableBtn.onclick = async () => { await enableAudio(); setStatus("Audio enabled.", "ok"); };
+  top.appendChild(enableBtn);
+
+  const countSel = document.createElement("select");
+  countSel.innerHTML = `
+    <option value="1" ${readCount===1?"selected":""}>Read: 1 note</option>
+    <option value="2" ${readCount===2?"selected":""}>Read: 2 notes</option>
+  `;
+  countSel.onchange = () => {
+    readCount = Number(countSel.value);
+    if(readCount === 1) readPlayMode = "separate";
+    newReadQuestion();
+  };
+  top.appendChild(countSel);
+
+  const playModeSel = document.createElement("select");
+  playModeSel.disabled = (readCount !== 2);
+  playModeSel.innerHTML = `
+    <option value="separate" ${readPlayMode==="separate"?"selected":""}>2 notes: Separate</option>
+    <option value="together" ${readPlayMode==="together"?"selected":""}>2 notes: Together (chord)</option>
+  `;
+  playModeSel.onchange = () => {
+    readPlayMode = playModeSel.value;
+    newReadQuestion();
+  };
+  top.appendChild(playModeSel);
+
+  const badge = document.createElement("span");
+  badge.className = "pill";
+  if(readCount === 2 && readPlayMode === "separate") badge.textContent = `Articulation: ${readArticulation}`;
+  else if(readCount === 2) badge.textContent = "Chord";
+  else badge.textContent = "Single";
+  top.appendChild(badge);
+
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "Next";
+  nextBtn.onclick = () => newReadQuestion();
+  top.appendChild(nextBtn);
+
+  const replayBtn = document.createElement("button");
+  replayBtn.textContent = "Replay";
+  replayBtn.onclick = async () => {
+    if(!readQ) return;
+    if(readCount === 1){
+      await playEvents(readBuildEvents(), { noteLen: READ_SINGLE_NOTE_LEN, gain: 0.95 });
+    } else {
+      await playEvents(readBuildEvents(), { articulation: readArticulation, gain: 0.95 });
+    }
+  };
+  top.appendChild(replayBtn);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.textContent = "Stop";
+  stopBtn.onclick = () => stopAllSounds();
+  top.appendChild(stopBtn);
+
+  controlsEl.appendChild(top);
+
+  // Progress indicator for 2-note reading
+  if(readCount === 2){
+    const prog = document.createElement("div");
+    prog.className = "row";
+    const p1 = document.createElement("span");
+    p1.className = "pill";
+    p1.textContent = readSolvedFirst ? "1st: ✅" : "1st: ?";
+    const p2 = document.createElement("span");
+    p2.className = "pill";
+    p2.textContent = readSolvedSecond ? "2nd: ✅" : "2nd: ?";
+    prog.appendChild(p1); prog.appendChild(p2);
+    controlsEl.appendChild(prog);
+  }
+
+  // Answer buttons
+  const row = document.createElement("div");
+  row.className = "row";
+
+  if(readCount === 1){
+    solfege.forEach(s=>{
+      const b = document.createElement("button");
+      b.textContent = s;
+      b.disabled = readSolved;
+      b.onclick = async ()=>{
+        if(!readQ) return;
+        const correct = readQ.notes[0].name;
+
+        if(s === correct){
+          readSolved = true;
+          setStatus(`✅ Correct: ${correct} (tap Next)`, "ok");
+          await playEvents([{t:0, notes:[readQ.notes[0].midi]}], { noteLen: READ_SINGLE_NOTE_LEN, gain:0.95 });
+          renderReadControls();
+        } else {
+          setStatus(`❌ Not ${s}. Try again, or tap Next to skip.`, "bad");
+        }
+      };
+      row.appendChild(b);
+    });
+    controlsEl.appendChild(row);
+    return;
+  }
+
+  // 2 notes: ordered answering (same behavior as your earlier two-note tab)
+  solfege.forEach(s=>{
+    const b = document.createElement("button");
+    b.textContent = s;
+    b.disabled = readSolvedSecond;
+
+    b.onclick = async ()=>{
+      if(!readQ) return;
+      const a = readQ.notes[0].name;
+      const c = readQ.notes[1].name;
+
+      if(!readSolvedFirst){
+        if(s === a){
+          readSolvedFirst = true;
+          setStatus(`✅ First correct (${a}). Now second.`, "ok");
+          renderReadControls();
+        } else {
+          setStatus(`❌ First is not ${s}. Try again, or tap Next.`, "bad");
+        }
+        return;
+      }
+
+      if(!readSolvedSecond){
+        if(s === c){
+          readSolvedSecond = true;
+          setStatus("✅ Correct. Tap Next.", "ok");
+          await playEvents(readBuildEvents(), { articulation: readArticulation, gain:0.95 });
+          renderReadControls();
+        } else {
+          setStatus(`❌ Second is not ${s}. Try again, or tap Next.`, "bad");
+        }
+      }
+    };
+
+    row.appendChild(b);
+  });
+
+  controlsEl.appendChild(row);
+}
+
+/* ============================================================
+   EAR TRAINING TAB (UNCHANGED BEHAVIOR)
+   ============================================================ */
+let earCount = 1;
+let earPlayMode = "separate";
+let earArticulation = "normal";
+let earQ = null;
+let earSolved = false;
+let earSolvedFirst = false;
+let earSolvedSecond = false;
+let earPickFirst = null;
+
+let earShowFirst = false;
+let earShowSecond = false;
+let earShowChord = false;
+
+function earResetVisual(){
+  earShowFirst = false;
+  earShowSecond = false;
+  earShowChord = false;
+}
+
+function earRenderVisual(){
+  drawStaff();
+  if(!earQ) return;
+
+  if(earCount === 1){
+    if(earShowFirst) drawNoteAt(earQ.notes[0].step, 260);
+    return;
+  }
+
+  if(earPlayMode === "together"){
+    if(earShowChord){
+      drawNoteAt(earQ.notes[0].step, 270);
+      drawNoteAt(earQ.notes[1].step, 270);
+    }
+    return;
+  }
+
+  const x1 = 210, x2 = 330;
+  if(earShowFirst) drawNoteAt(earQ.notes[0].step, x1);
+  if(earShowSecond) drawNoteAt(earQ.notes[1].step, x2);
+  if(earShowFirst && earShowSecond && earArticulation === "legato"){
+    drawSlurAbove(x1, earQ.notes[0].step, x2, earQ.notes[1].step);
+  }
+}
+
+function buildEarEvents(){
+  const stepLen = Number(stepSel.value);
+  const midis = earQ.notes.map(n => n.midi);
+
+  if(earCount === 1) return [{ t:0, notes:[midis[0]] }];
+  if(earPlayMode === "together") return [{ t:0, notes:[midis[0], midis[1]] }];
+  return [{ t:0, notes:[midis[0]] }, { t:stepLen, notes:[midis[1]] }];
+}
+
+async function earReplay(){
+  if(!earQ) return;
+  const events = buildEarEvents();
+  const opts = (earCount===2 && earPlayMode==="separate")
+    ? { articulation: earArticulation, gain: 0.9, noteLen: EAR_REVEAL_NOTE_LEN }
+    : { articulation: "normal", gain: 0.9, noteLen: EAR_REVEAL_NOTE_LEN };
+  await playEvents(events, opts);
+}
+
+async function earPlayTappedSyllable(syllable){
+  if(!earQ) return;
+  const inQuestion = earQ.notes.find(n => n.name === syllable);
+  if(inQuestion){
+    await playEvents([{ t:0, notes:[inQuestion.midi] }], { noteLen: EAR_TAP_NOTE_LEN, gain: 0.9 });
+    return;
+  }
+  const pool = getActivePool().filter(n => n.name === syllable);
+  if(pool.length){
+    const n = pool[randInt(pool.length)];
+    await playEvents([{ t:0, notes:[n.midi] }], { noteLen: EAR_TAP_NOTE_LEN, gain: 0.9 });
+  }
+}
+
+function earReveal(){
+  if(!earQ) return;
+  setStatus(earQ.revealText, "ok");
+
+  if(earCount === 1) earShowFirst = true;
+  else if(earPlayMode === "together") earShowChord = true;
+  else { earShowFirst = true; earShowSecond = true; }
+
+  earRenderVisual();
+}
+
+async function newEarQuestion(autoPlay = false){
+  stopAllSounds();
+  earSolved = false;
+  earSolvedFirst = false;
+  earSolvedSecond = false;
+  earPickFirst = null;
+  earResetVisual();
+
+  const pool = getActivePool();
+
+  if(earCount === 1){
+    const n = pool[randInt(pool.length)];
+    earQ = { notes:[n], revealText:`Answer: ${n.name}` };
+    earArticulation = "normal";
+  } else {
+    const i1 = randInt(pool.length);
+    const i2 = pickNextIndex(i1, pool);
+    const n1 = pool[i1];
+    const n2 = pool[i2];
+
+    const isChord = (earPlayMode === "together");
+    earArticulation = (!isChord && Math.random() < TWO_NOTE_LEGATO_PROB) ? "legato" : "normal";
+
+    earQ = {
+      notes:[n1,n2],
+      revealText: isChord
+        ? `Answer (chord): ${n1.name} + ${n2.name}`
+        : `Answer: ${n1.name} → ${n2.name} (${earArticulation.toUpperCase()})`
+    };
+  }
+
+  earRenderVisual();
+  setStatus("Ear training: listen, then answer. (Auto-play on new question.)");
+  renderEarControls();
+
+  if(autoPlay){
+    try { await earReplay(); } catch(e) {}
+  }
+}
+
+function renderEarControls(){
+  controlsEl.innerHTML = "";
+
+  const top = document.createElement("div");
+  top.className = "row";
+
+  const enableBtn = document.createElement("button");
+  enableBtn.textContent = "Enable audio";
+  enableBtn.onclick = async () => {
+    await enableAudio();
+    setStatus("Audio enabled.", "ok");
+    try { await earReplay(); } catch(e) {}
+  };
+  top.appendChild(enableBtn);
+
+  const countSel = document.createElement("select");
+  countSel.innerHTML = `
+    <option value="1" ${earCount===1?"selected":""}>Ear: 1 note</option>
+    <option value="2" ${earCount===2?"selected":""}>Ear: 2 notes</option>
+  `;
+  countSel.onchange = async () => {
+    earCount = Number(countSel.value);
+    if(earCount === 1) earPlayMode = "separate";
+    await newEarQuestion(true);
+  };
+  top.appendChild(countSel);
+
+  const playModeSel = document.createElement("select");
+  playModeSel.disabled = (earCount !== 2);
+  playModeSel.innerHTML = `
+    <option value="separate" ${earPlayMode==="separate"?"selected":""}>2 notes: Separate</option>
+    <option value="together" ${earPlayMode==="together"?"selected":""}>2 notes: Together (chord)</option>
+  `;
+  playModeSel.onchange = async () => {
+    earPlayMode = playModeSel.value;
+    await newEarQuestion(true);
+  };
+  top.appendChild(playModeSel);
+
+  const badge = document.createElement("span");
+  badge.className = "pill";
+  if(earCount === 2 && earPlayMode === "separate") badge.textContent = `Articulation: ${earArticulation}`;
+  else if(earCount === 2) badge.textContent = "Chord";
+  else badge.textContent = "Single";
+  top.appendChild(badge);
+
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "Next";
+  nextBtn.onclick = async () => { await newEarQuestion(true); };
+  top.appendChild(nextBtn);
+
+  const replayBtn = document.createElement("button");
+  replayBtn.textContent = "Replay";
+  replayBtn.onclick = async () => { await earReplay(); };
+  top.appendChild(replayBtn);
+
+  const revealBtn = document.createElement("button");
+  revealBtn.textContent = "Reveal";
+  revealBtn.onclick = () => earReveal();
+  top.appendChild(revealBtn);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.textContent = "Stop";
+  stopBtn.onclick = () => stopAllSounds();
+  top.appendChild(stopBtn);
+
+  controlsEl.appendChild(top);
+
+  const row = document.createElement("div");
+  row.className = "row";
+
+  if(earCount === 1){
+    solfege.forEach(s=>{
+      const b = document.createElement("button");
+      b.textContent = s;
+      b.disabled = earSolved;
+      b.onclick = async ()=>{
+        if(!earQ) return;
+        await earPlayTappedSyllable(s);
+
+        const correct = earQ.notes[0].name;
+        if(s === correct){
+          earSolved = true;
+          earShowFirst = true;
+          earRenderVisual();
+          setStatus(`✅ Correct: ${correct}`, "ok");
+          renderEarControls();
+        } else {
+          setStatus(`❌ Not ${s}. Try again, or Reveal / Next.`, "bad");
+        }
+      };
+      row.appendChild(b);
+    });
+    controlsEl.appendChild(row);
+    return;
+  }
+
+  solfege.forEach(s=>{
+    const b = document.createElement("button");
+    b.textContent = s;
+    b.disabled = earSolved;
+    b.onclick = async ()=>{
+      if(!earQ) return;
+      await earPlayTappedSyllable(s);
+
+      const a = earQ.notes[0].name;
+      const c = earQ.notes[1].name;
+
+      if(earPlayMode === "separate"){
+        if(!earSolvedFirst){
+          if(s === a){
+            earSolvedFirst = true;
+            earShowFirst = true;
+            earRenderVisual();
+            setStatus(`✅ First correct (${a}). Now second.`, "ok");
+            renderEarControls();
+          } else {
+            setStatus(`❌ First is not ${s}. Try again, or Reveal / Next.`, "bad");
+          }
+          return;
+        }
+        if(!earSolvedSecond){
+          if(s === c){
+            earSolvedSecond = true;
+            earSolved = true;
+            earShowSecond = true;
+            earRenderVisual();
+            setStatus(`✅ Correct: ${a} → ${c} (${earArticulation.toUpperCase()})`, "ok");
+            renderEarControls();
+          } else {
+            setStatus(`❌ Second is not ${s}. Try again, or Reveal / Next.`, "bad");
+          }
+        }
+        return;
+      }
+
+      if(earPickFirst === null){
+        earPickFirst = s;
+        setStatus(`Picked first: ${s}. Now pick the other note.`, "");
+        renderEarControls();
+        return;
+      }
+
+      const pick1 = earPickFirst;
+      const pick2 = s;
+      const correctSet = new Set([a, c]);
+      const pickSet = new Set([pick1, pick2]);
+      const ok = (pickSet.size === correctSet.size) && [...pickSet].every(x => correctSet.has(x));
+
+      if(ok){
+        earSolved = true;
+        earShowChord = true;
+        earRenderVisual();
+        setStatus(`✅ Correct chord: ${a} + ${c}`, "ok");
+        renderEarControls();
+      } else {
+        setStatus(`❌ Not that chord. Try again, or Reveal / Next.`, "bad");
+        earPickFirst = null;
+        renderEarControls();
+      }
+    };
+    row.appendChild(b);
+  });
+
+  controlsEl.appendChild(row);
+}
+
+/* -------------------- MODE SWITCH -------------------- */
+async function init(){
+  stopAllSounds();
+  if(mode === "read"){
+    modeBadge.textContent = "Reading";
+    newReadQuestion();
+  } else {
+    modeBadge.textContent = "Ear";
+    earResetVisual();
+    drawStaff();
+    await newEarQuestion(true);
+  }
+}
+
+document.getElementById("tabRead").onclick = ()=>{ mode="read"; init(); };
+document.getElementById("tabEar").onclick = ()=>{ mode="ear"; init(); };
+
+ledgerToggle.onchange = async ()=> {
+  if(mode === "read") newReadQuestion();
+  else await newEarQuestion(true);
+};
+
+stepSel.onchange = ()=> {
+  if(mode === "read") readRenderVisual();
+  else earRenderVisual();
+};
+
+init();
+</script>
+</body>
+</html>
